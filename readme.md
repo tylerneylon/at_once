@@ -22,28 +22,49 @@ bad output and start again.
 
         import at_once
 
-        def is_inp_done(inp):
+        def check_inp(inp):
 
             # ... Parallel-friendly code.
 
-            return is_done  # True or False.
+            # In a map-only situation, return:
+            return [is_done, None]
 
-        def handle_inp(inp):
+            # In a map-reduce setup, return:
+            return [is_done, value_if_is_done]
+
+        def process_inp(inp):
 
             # ... Parallel-friendly code.
 
             # Save result to disk; return nothing.
 
-        at_once.run(inp_list, is_inp_done, handle_inp)
+        at_once.run(inp_list, check_inp, process_inp)
+
+    ----------------------------------------------------------------------
 
     This spawns one process per local cpu core, and runs
     those processes in parallel, keeping each one busy with
-    continuous handle_inp() calls over all of inp_list,
+    continuous process_inp() calls over all of inp_list,
     skipping over any `inp` values for which
-    is_inp_done(inp) returns True.
+    check_inp(inp) returns True.
 
     The purpose of this little library is to assist in
     running crash-robust steps of a large data pipeline.
+
+    ----------------------------------------------------------------------
+    Reduce functions
+
+    You can send in an optional `reduce_fn` parameter to at_once.run().
+    If you do, it will receive a list of consolidated values per key
+    that is output by process_inp(). The output of reduce_fn() then
+    becomes the value of the same key, and the dictionary of all these
+    keys and all these reduced values is the return value from
+    at_once.run(). If this is super-confusing: This is a standard
+    map-reduce setup. I recommend reading online about map-reduce in
+    general.
+
+    ----------------------------------------------------------------------
+    Logging output
 
     I recommend setting the value
 
@@ -55,6 +76,8 @@ bad output and start again.
 
     in order to record errors; don't print anything to
     stdout or stderr.
+
+    ----------------------------------------------------------------------
 
     The optional keyword parameter do_shuffle to at_once.run()
     is False by default; if True, it will shuffle inp_list
