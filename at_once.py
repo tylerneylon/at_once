@@ -109,7 +109,14 @@ def _manage_inp(triple):
     else:
         return process_inp(inp)
 
-def run(inp_list, check_inp, process_inp, do_shuffle=False, reduce_fn=None):
+def run(
+        inp_list,
+        check_inp,
+        process_inp,
+        do_shuffle = False,
+        reduce_fn = None,
+        do_flatten_values = False
+        ):
 
     if do_shuffle:
         np.random.shuffle(inp_list)
@@ -129,10 +136,13 @@ def run(inp_list, check_inp, process_inp, do_shuffle=False, reduce_fn=None):
         kv_to_reduce = {}
         for kv_map in data:
             for key, value in kv_map.items():
-                kv_to_reduce.setdefault(key, []).append(value)
+                if do_flatten_values:
+                    kv_to_reduce.setdefault(key, []).extend(value)
+                else:
+                    kv_to_reduce.setdefault(key, []).append(value)
 
         # Collect the reductions.
         return {
-                key: reduce_fn(values)
+                key: reduce_fn(key, values)
                 for key, values in kv_to_reduce.items()
         }
