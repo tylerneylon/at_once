@@ -115,8 +115,12 @@ def run(
         process_inp,
         do_shuffle = False,
         reduce_fn = None,
+        combine_fn = None,
+        postprocess_fn = None,
         do_flatten_values = False
         ):
+
+    assert not (reduce_fn and combine_fn)
 
     if do_shuffle:
         np.random.shuffle(inp_list)
@@ -126,7 +130,7 @@ def run(
     with Pool(os.cpu_count()) as p:
         data = list(tqdm(p.imap(_manage_inp, task_list), total=length))
 
-    if reduce_fn is None:
+    if reduce_fn is None and combine_fn is None:
 
         return data
 
@@ -142,7 +146,25 @@ def run(
                     kv_to_reduce.setdefault(key, []).append(value)
 
         # Collect the reductions.
-        return {
-                key: reduce_fn(key, values)
-                for key, values in kv_to_reduce.items()
-        }
+        if reduce_fn:
+
+            return {
+                    key: reduce_fn(key, values)
+                    for key, values in kv_to_reduce.items()
+            }
+
+        else:
+
+            print('Combining results ..')
+            combined_results = {}
+            for key, values in tqdm(kv_to_reduce.items()):
+                combined = values.pop(0)
+                while len(values) > 0:
+                    combined = combine_fn(key, combined, values.pop(0))
+                combined_results[key] = combined
+            if postprocess_fn is None:
+                return combined_results
+            return {
+                k: postprocess_fn(k, v)
+                for k, v in combined_results.items()
+            }
