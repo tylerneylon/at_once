@@ -1,5 +1,7 @@
 """ at_once.py
 
+    TODO -- Completely re-write this.
+
     Usage:
 
         import at_once
@@ -77,26 +79,223 @@
 # ______________________________________________________________________
 # Imports
 
+import fcntl
+import json
 import os
-from itertools import repeat
-from multiprocessing import Pool
+import pickle
+import sys
+import time
+import uuid
+
+from   collections     import defaultdict
+from   glob            import glob
+from   hashlib         import sha256
+from   itertools       import repeat
+from   multiprocessing import Manager, Pool
+from   pathlib         import Path
 
 import numpy as np
-from tqdm import tqdm
+from   tqdm import tqdm
+
+# XXX
+import multiprocessing as mp
 
 
 # ______________________________________________________________________
-# Globals and Constants
+# Classes
 
-logfile = 'at_once_log.txt'
+class Job(object):
+
+    def __init__(
+            self,
+            input_files      = None,
+            input_list       = None,
+            do_shuffle       = False,
+            output_dir       = None,
+            num_output_files = None,
+            cache_root       = None,
+            num_processes    = None,
+            is_one_value     = False
+    ):
+
+        if input_list is not None:
+            assert input_files is None
+            self.input      = list(input_list)  # The `list` is to copy it.
+            self.input_type = 'list'
+        else:
+            assert input_list is None
+            self.input      = list(input_files)  # The `list` is to copy it.
+            self.input_type = 'files'
+        assert self.input is not None
+
+        if do_shuffle:
+            np.random.shuffle(self.input)
+
+        # Set up the temporary directory.
+        assert cache_root is not None
+        cache_root = Path(cache_root)
+        hash_num = hash(sys.argv[0]) % 100000
+        g = glob(f'{cache_root}/*{hash_num}')
+        if len(g) == 0:
+            time_str = time.strftime('%Y_%m_%d_%H_%M')
+            self.cache_dir = Path(cache_root) / f'{time_str}_{hash_num}'
+            self.cache_dir.mkdir(parents=True, exist_ok=True)
+            print(f'Using the new cache directory {self.cache_dir}')
+        else:
+            if len(g) > 1:
+                print(f'WARNING: I see multiple cache directories I might use.')
+            self.cache_dir = Path(g[0])
+            print(f'Using the pre-existing cache directory {self.cache_dir}')
+
+        self.logfile = self.cache_dir / 'logfile.jsonl'
+
+        self.output_dir = None
+        if output_dir:
+            self.output_dir = Path(output_dir)
+            self.output_dir.mkdir(parents=True, exist_ok=True)
+            print(f'Output will be saved to {self.output_dir}')
+
+        self.num_output_files = len(self.input)
+        if num_output_files:
+            self.num_output_files = num_output_files
+
+        self.num_processes = num_processes or os.cpu_count()
+
+        self.run_id_of_input = {}
+        self.saved_inp_filepath = self.cache_dir / 'saved_inputs.jsonl'
+        if self.saved_inp_filepath.is_file():
+            with self.saved_inp_filepath.open() as f:
+                for line in f:
+                    obj = json.loads(line)
+                    self.run_id_of_input[obj['input']] = obj['run_id']
+
+        self.run_id = str(uuid.uuid4())[-8:]
+
+        self.is_one_value = is_one_value
+
+    def log(self, msg_obj):
+        with self.logfile.open('a') as f:
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+            f.write(json.dumps(msg_obj) + '\n')
+
+    def _append_to_cache(self, inp, key, value):
+        n = self.num_output_files
+        i = hash(str(key)) % n
+        num_digits = len(str(n - 1))
+        outfile = self.cache_dir / f'{str(i).zfill(num_digits)}_of_{n}.jsonl'
+        with outfile.open('a') as f:
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+            s = json.dumps({
+                'key': key,
+                'value': value,
+                'run_id': self.run_id,
+                'input': inp
+            })
+            f.write(s + '\n')
+    # XXX
+    def _print(self, s):
+        proc = mp.current_process()
+        t = time.asctime()
+        # print(f'{proc.name} {t}: {s}', flush=True)
+
+    def _handle_input(self, inp):
+
+        self._print(f'About to handle input: {inp}')
+
+        # Check to see if `inp` already has output in our cache_dir.
+        if inp in self.run_id_of_input:
+            self._print(f'    Skipping bc its cached.')
+            return
+
+        # Process the input.
+        if self.input_type == 'list':
+            self._print(f'About to call map_fn on {inp}')
+            results = self.map_fn(inp)
+            self._print(f'Just finished map_fn on {inp}')
+            if not self.is_one_value:
+                assert all(type(v) is list for v in results.values())
+        else:
+            # TODO
+            results = self.map_fn(key, value)
+
+        self._print(f'About to append to cache.')
+        for key, value in results.items():
+            self._append_to_cache(inp, key, value)
+        self._print(f'Just appended to cache; about to record inp saved.')
+        # TODO: Eventually, I may want to put a mutex around these
+        #       writes. In the meantime, it looks like writes under ~1k
+        #       will be atomic on my os/fs, so this is ok for now.
+        with self.saved_inp_filepath.open('a') as f:
+            f.write(json.dumps({'input': inp, 'run_id': self.run_id}) + '\n')
+        self.run_id_of_input[inp] = self.run_id
+        self._print(f'Just recorded inp saved.')
+
+    def _handle_cache(self, cache_file):
+
+        assert self.output_dir is not None
+
+        # Load in the full cache file, filtering out possible
+        # partial data from a crashed-out run.
+        cache = defaultdict(list)
+        with open(cache_file) as f:
+            for i, line in enumerate(f):
+                obj = json.loads(line)
+
+                # XXX
+                if 'input' not in obj:
+                    print('\n\n\n')
+                    print(f'Problem in {cache_file}')
+                    print(f'On 1-based line number {i + 1}')
+
+                inp_run_id = self.run_id_of_input.get(obj['input'], None)
+                if inp_run_id != obj['run_id']:
+                    continue
+                if self.is_one_value:
+                    cache[obj['key']] = obj['value']
+                else:
+                    cache[obj['key']].extend(obj['value'])
+        cache = dict(cache)
+
+        # TODO: This is a good place to run combine / reduce.
+
+        # Save to the official output directory.
+        filename = cache_file.name.split('.')[0] + '.pickle'
+        with (self.output_dir / filename).open('wb') as f:
+            pickle.dump(cache, f)
+
+    def run(
+            self,
+            map_fn     = None,
+            combine_fn = None,
+            reduce_fn  = None
+    ):
+        assert map_fn is not None
+        self.map_fn = map_fn
+
+        t = len(self.input)
+
+        # XXX
+        print(f'self.input has length {len(self.input)}.')
+
+        with Pool(self.num_processes) as p:
+            list(tqdm(p.imap(self._handle_input, self.input), total=t))
+
+        if self.output_dir:
+            n = self.num_output_files
+            cache_data = list(self.cache_dir.glob(f'*_of_{n}.jsonl'))
+            t = len(cache_data)
+            with Pool(self.num_processes) as p:
+                list(tqdm(p.imap(self._handle_cache, cache_data), total=t))
 
 
 # ______________________________________________________________________
 # Functions
 
-def log(msg):
-    with open(logfile, 'a') as f:
-        f.write(msg + '\n')
+def hash(s):
+    ''' Return a (usually quite large) integer hash of the given
+        string s. '''
+    assert type(s) is str
+    return int.from_bytes(sha256(s.encode()).digest(), byteorder='big')
 
 def _manage_inp(triple):
 
@@ -109,6 +308,10 @@ def _manage_inp(triple):
     else:
         return process_inp(inp)
 
+# XXX Working notes.
+#
+#  * Expect either input_files (a list of filenames, glob-friendly), or
+#  * input_list, which is passed directly to the handler (no caching).
 def run(
         inp_list,
         check_inp,
