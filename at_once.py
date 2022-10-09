@@ -89,19 +89,28 @@ import sys
 import time
 import uuid
 
-from   collections     import defaultdict
-from   glob            import glob
-from   hashlib         import sha256
-from   itertools       import repeat
-from   pathlib         import Path
+from collections import defaultdict
+from glob        import glob
+from hashlib     import sha256
+from itertools   import repeat
+from pathlib     import Path
 
 import numpy as np
-from   tqdm import tqdm
+from tqdm import tqdm
 
 
-# XXX
+# ______________________________________________________________________
+# Debug
+
+do_dbg_timing = True
+
+
+# ______________________________________________________________________
+# Queues
+
 map_pbar_q   = mp.Queue()
 cache_pbar_q = mp.Queue()
+avg_times_q  = mp.Queue()
 
 
 # ______________________________________________________________________
@@ -126,6 +135,7 @@ class Job(object):
             do_map_per_chunk = False,
             job_key          = None,
             do_silent_mode   = False,
+            map_type         = 'arbitrary',
             **kwargs
     ):
         self.do_silent_mode = do_silent_mode
@@ -194,6 +204,8 @@ class Job(object):
         self.last_event = None
         self.last_time  = None
         self.dbg_log = self.cache_dir / 'dbg_log.jsonl'
+
+        self.dbg_timing = {}
 
     def _assign_name(self, i):
         proc = mp.current_process()
@@ -274,8 +286,10 @@ class Job(object):
             # Process input files.
             chunk_num = int(Path(inp).stem.split('_')[0])
             self._dbg_log_event('load from pickle file')
+
             with open(inp, 'rb') as f:
                 data = pickle.load(f)
+
             self._dbg_log_event('call map_fn')
             if self.do_map_per_chunk:
                 result = self.map_fn(chunk_num, data)
@@ -311,6 +325,15 @@ class Job(object):
         self._dbg_log_event('XXX')  # XXX
         map_pbar_q.put(1)
 
+    def _start_dbg_time(self, time_type):
+        if do_dbg_timing:
+            self.dbg_timing[time_type] = time.time()
+
+    def _end_dbg_time(self, time_type):
+        if do_dbg_timing:
+            duration = time.time() - self.dbg_timing[time_type]
+            avg_times_q.put((time_type, duration))
+
     def _handle_cache(self, cache_file):
 
         # print('Start of _handle_cache()')
@@ -322,6 +345,7 @@ class Job(object):
         cache = defaultdict(list)
         with open(cache_file) as f:
             for i, line in enumerate(f):
+                self._start_dbg_time('json_decode')
                 try:
                     obj = json.loads(line)
                 except json.decoder.JSONDecodeError as e:
@@ -338,7 +362,9 @@ class Job(object):
                     print('Ending of line is next:')
                     print(line[-1000:])
                     raise
+                self._end_dbg_time('json_decode')
 
+                self._start_dbg_time('post_json_decode_checks')
                 # XXX
                 if 'input' not in obj:
                     print('\n\n\n')
@@ -354,7 +380,12 @@ class Job(object):
                     print(f'run_id on file is {inp_run_id}')
                     print(f'   My run id is {self.run_id}')
                     continue
+                self._end_dbg_time('post_json_decode_checks')
+
+                self._start_dbg_time('b64_unpickling')
                 value = decode(obj['value'])
+                self._end_dbg_time('b64_unpickling')
+
                 if self.is_one_value:
                     cache[obj['key']] = value
                 else:
@@ -373,9 +404,11 @@ class Job(object):
         # TODO: Call reduce_fn() if it's present.
 
         # Save to the official output directory.
+        self._start_dbg_time('write_to_file')
         filename = cache_file.name.split('.')[0] + '.pickle'
         with (self.output_dir / filename).open('wb') as f:
             pickle.dump(cache, f)
+        self._end_dbg_time('write_to_file')
 
         # print(f'Sending out 2 to pbar_q.')  # XXX
         cache_pbar_q.put(1)
@@ -416,11 +449,20 @@ class Job(object):
                             print(f'In show_pbar(), n={n}')
                 pbar.update(n=pbar.total - n)
                 pbar.close()
-                print('From show_pbar(), finishing!')
-                print(f'I received {n} updates.')
+
+            def avg_times(q):
+                times = defaultdict(list)
+                for update in iter(q.get, 'STOP'):
+                    time_type, time = update
+                    times[time_type].append(time)
+                for k, v in times.items():
+                    print(f'{k}: {sum(v) / len(v):.4f}')
 
             pbar_args = (map_pbar_q, t, 'Map to cache')
             mp.Process(target=show_pbar, args=pbar_args).start()
+
+            if do_dbg_timing:
+                mp.Process(target=avg_times, args=(avg_times_q,)).start()
 
             N = self.num_processes
             # print(f'Starting map_fn() calls, t={t}')  # XXX
@@ -445,6 +487,7 @@ class Job(object):
                 with mp.Pool(N) as p:
                     list(p.map(self._handle_cache, cache_data))
                     cache_pbar_q.put('STOP')
+                avg_times_q.put('STOP')
 
 
 # ______________________________________________________________________
