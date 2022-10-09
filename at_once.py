@@ -187,9 +187,9 @@ class Job(object):
         self.num_processes = num_processes or os.cpu_count()
 
         self.run_id_of_input = {}
-        self.saved_inp_filepath = self.cache_dir / 'saved_inputs.jsonl'
-        if self.saved_inp_filepath.is_file():
-            with self.saved_inp_filepath.open() as f:
+        self.data_receipt = self.cache_dir / 'data_receipt.jsonl'
+        if self.data_receipt.is_file():
+            with self.data_receipt.open() as f:
                 for line in f:
                     obj = json.loads(line)
                     self.run_id_of_input[obj['input']] = obj['run_id']
@@ -218,7 +218,7 @@ class Job(object):
             return
         print(s)
 
-    def _dbg_log_event(self, eventname):
+    def _dbg_log_event_start(self, eventname):
 
         worker_id = mp.current_process().name
         t = time.time()
@@ -264,7 +264,7 @@ class Job(object):
     def _handle_input(self, inp):
 
         # self._print(f'About to handle input: {inp}')
-        self._dbg_log_event('start of input')
+        self._dbg_log_event_start('start of input')
 
         # Check to see if `inp` already has output in our cache_dir.
         if inp in self.run_id_of_input:
@@ -276,21 +276,21 @@ class Job(object):
         out_chunk = None
         if self.input_type == 'list':
             # self._print(f'About to call map_fn on {inp}')
-            self._dbg_log_event('call map_fn()')
+            self._dbg_log_event_start('call map_fn()')
             result = self.map_fn(inp)
             # self._print(f'Just finished map_fn on {inp}')
-            self._dbg_log_event('verify map_fn() output type')
+            self._dbg_log_event_start('verify map_fn() output type')
             if not self.is_one_value:
                 assert all(type(v) is list for v in result.values())
         else:
             # Process input files.
             chunk_num = int(Path(inp).stem.split('_')[0])
-            self._dbg_log_event('load from pickle file')
+            self._dbg_log_event_start('load from pickle file')
 
             with open(inp, 'rb') as f:
                 data = pickle.load(f)
 
-            self._dbg_log_event('call map_fn')
+            self._dbg_log_event_start('call map_fn')
             if self.do_map_per_chunk:
                 result = self.map_fn(chunk_num, data)
                 assert type(result) is dict
@@ -304,25 +304,22 @@ class Job(object):
                         continue
                     for out_k, out_v in out.items():
                         assert type(out_v) is list
-                        self._dbg_log_event('append out to result')
+                        self._dbg_log_event_start('append out to result')
                         result[out_k].extend(out_v)
 
-        self._dbg_log_event('mark input as saved')
-        # self._print(f'About to append to cache.')
+        self._dbg_log_event_start('mark input as saved')
         for key, value in result.items():
             self._append_to_cache(inp, key, value, out_chunk)
-        # self._print(f'Just appended to cache; about to record inp saved.')
 
         # TODO: Eventually, I may want to put a mutex around these
         #       writes. In the meantime, it looks like writes under ~1k
         #       will be atomic on my os/fs, so this is ok for now.
-        with self.saved_inp_filepath.open('a') as f:
+        with self.data_receipt.open('a') as f:
             f.write(json.dumps({'input': inp, 'run_id': self.run_id}) + '\n')
         self.run_id_of_input[inp] = self.run_id
-        # self._print(f'Just recorded inp saved.')
-        self._dbg_log_event('ready for next input')
+        self._dbg_log_event_start('ready for next input')
 
-        self._dbg_log_event('XXX')  # XXX
+        self._dbg_log_event_start('XXX')  # XXX
         map_pbar_q.put(1)
 
     def _start_dbg_time(self, time_type):
@@ -335,8 +332,6 @@ class Job(object):
             avg_times_q.put((time_type, duration))
 
     def _handle_cache(self, cache_file):
-
-        # print('Start of _handle_cache()')
 
         assert self.output_dir is not None
 
@@ -406,8 +401,13 @@ class Job(object):
         # Save to the official output directory.
         self._start_dbg_time('write_to_file')
         filename = cache_file.name.split('.')[0] + '.pickle'
-        with (self.output_dir / filename).open('wb') as f:
+        filepath = self.output_dir / filename
+        with (filepath).open('wb') as f:
             pickle.dump(cache, f)
+        with (self.output_dir / 'data_receipt.jsonl').open('a') as f:
+            ctime = filepath.stat().st_ctime
+            receipt = {'saved_file': filename, 'ctime': ctime}
+            f.write(json.dumps(receipt) + '\n')
         self._end_dbg_time('write_to_file')
 
         # print(f'Sending out 2 to pbar_q.')  # XXX
@@ -428,10 +428,10 @@ class Job(object):
         t = len(self.input)
 
         # XXX TODO
-        prog = pass_thru if self.do_silent_mode else tqdm
+        progress = pass_thru if self.do_silent_mode else tqdm
 
         if self.num_processes == 1:
-            for inp in prog(self.input):
+            for inp in progress(self.input):
                 self._handle_input(inp)
         else:
 
@@ -473,15 +473,12 @@ class Job(object):
                 map_pbar_q.put('STOP')
 
         if self.output_dir:
-            # print('Starting handle_cache() calls')  # XXX
             cache_data = list(self.cache_dir.glob(f'*_of_*.jsonl'))
             t = len(cache_data)
             if self.num_processes == 1:
-                for cache_item in prog(cache_data):
+                for cache_item in progress(cache_data):
                     self._handle_cache(cache_item)
             else:
-                # print('About to call p.map()')  # XXX
-                # print(f'len(cache_data) = {len(cache_data)}')
                 pbar_args = (cache_pbar_q, t, 'Cache to output')
                 mp.Process(target=show_pbar, args=pbar_args).start()
                 with mp.Pool(N) as p:
