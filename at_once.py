@@ -335,6 +335,12 @@ class Job(object):
 
         assert self.output_dir is not None
 
+        # If a data receipt exists, skip out early.
+        # We send a message to the appropriate queue for progress.
+        if self.does_cache_have_output(cache_file):
+            cache_pbar_q.put(1)
+            return
+
         # Load in the full cache file, filtering out possible
         # partial data from a crashed-out run.
         cache = defaultdict(list)
@@ -400,25 +406,63 @@ class Job(object):
 
         # Save to the official output directory.
         self._start_dbg_time('write_to_file')
-        filename = cache_file.name.split('.')[0] + '.pickle'
-        filepath = self.output_dir / filename
-        with (filepath).open('wb') as f:
+        output_path = self.get_output_path(cache_file)
+        with output_path.open('wb') as f:
             pickle.dump(cache, f)
-        self.save_output_receipt(filepath)
+        self.save_output_receipt(output_path)
         self._end_dbg_time('write_to_file')
 
         # print(f'Sending out 2 to pbar_q.')  # XXX
         cache_pbar_q.put(1)
 
-    def save_output_receipt(self, filepath):
+    def get_output_path(self, cache_file):
+        name = cache_file.name
+        return self.output_dir / (name.split('.')[0] + '.pickle')
+
+    def get_output_receipts(self):
+        if 'output_receipts' not in self.__dict__:
+            self.output_receipts = {}
+            metadata_dir = self.get_metadata_dir()
+            with (metadata_dir / 'data_receipt.jsonl').open() as f:
+                for line in f:
+                    obj = json.loads(line)
+                    fname = obj['saved_file']
+                    ctime = obj['ctime']
+                    self.output_receipts[fname] = ctime
+        return self.output_receipts
+
+    def get_metadata_dir(self):
         if 'metadata_dir' not in self.__dict__:
             self.metadata_dir = self.output_dir / 'metadata'
             self.metadata_dir.mkdir(parents=True, exist_ok=True)
-        data_receipt = self.metadata_dir / 'data_receipt.jsonl'
+        return self.metadata_dir
+
+    def save_output_receipt(self, filepath):
+        metadata_dir = self.get_metadata_dir()
+        data_receipt = metadata_dir / 'data_receipt.jsonl'
         with data_receipt.open('a') as f:
             ctime = filepath.stat().st_ctime
             receipt = {'saved_file': filepath.name, 'ctime': ctime}
             f.write(json.dumps(receipt) + '\n')
+
+    def does_cache_have_output(self, cache_file):
+
+        # Check that the output file exists.
+        output_path     = self.get_output_path(cache_file)
+        if not output_path.is_file():
+            return False
+
+        # Check that the output file has a receipt.
+        output_receipts = self.get_output_receipts()
+        receipt_ctime = output_receipts.get(output_path.name, None)
+        if receipt_ctime is None:
+            return False
+
+        # Verify that the output receipt is for this data.
+        # This is a heuristic that, in practice, I expect to essentially always
+        # work.
+        file_ctime = output_path.stat().st_ctime
+        return abs(file_ctime - receipt_ctime) < 0.001
 
     def run(
             self,
