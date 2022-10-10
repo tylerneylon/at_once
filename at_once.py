@@ -404,14 +404,21 @@ class Job(object):
         filepath = self.output_dir / filename
         with (filepath).open('wb') as f:
             pickle.dump(cache, f)
-        with (self.output_dir / 'data_receipt.jsonl').open('a') as f:
-            ctime = filepath.stat().st_ctime
-            receipt = {'saved_file': filename, 'ctime': ctime}
-            f.write(json.dumps(receipt) + '\n')
+        self.save_output_receipt(filepath)
         self._end_dbg_time('write_to_file')
 
         # print(f'Sending out 2 to pbar_q.')  # XXX
         cache_pbar_q.put(1)
+
+    def save_output_receipt(self, filepath):
+        if 'metadata_dir' not in self.__dict__:
+            self.metadata_dir = self.output_dir / 'metadata'
+            self.metadata_dir.mkdir(parents=True, exist_ok=True)
+        data_receipt = self.metadata_dir / 'data_receipt.jsonl'
+        with data_receipt.open('a') as f:
+            ctime = filepath.stat().st_ctime
+            receipt = {'saved_file': filepath.name, 'ctime': ctime}
+            f.write(json.dumps(receipt) + '\n')
 
     def run(
             self,
