@@ -535,7 +535,7 @@ class Job(object):
                 with mp.Pool(N) as p:
                     list(p.map(self._handle_cache, cache_data))
                     cache_pbar_q.put('STOP')
-                avg_times_q.put('STOP')
+                    avg_times_q.put('STOP')
 
 
 # ______________________________________________________________________
