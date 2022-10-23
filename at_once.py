@@ -141,7 +141,6 @@ class Job(object):
             cache_root       = None,
             num_processes    = None,
             is_one_value     = False,
-            do_map_per_chunk = False,
             job_key          = None,
             do_silent_mode   = False,
             map_type         = ARBITRARY,
@@ -207,7 +206,7 @@ class Job(object):
 
         self.is_one_value = is_one_value
 
-        self.do_map_per_chunk = do_map_per_chunk
+        self.do_map_per_chunk = (map_type == MAP_CHUNKS)
 
         assert map_type in [ARBITRARY, KEEP_KEYS, MAP_CHUNKS]
         self.map_type = map_type
@@ -261,7 +260,6 @@ class Job(object):
             })
             f.write(s + '\n')
 
-    # TODO: Factor out the commonalities between this and handle_cache().
     def _handle_chunked_input(self, chunked_inp):
         """ This expects chunked_inp = (chunk_num, input_list).
             This maps all inputs at once, saving them directly to the output
@@ -326,21 +324,25 @@ class Job(object):
                 data = pickle.load(f)
 
             self._dbg_log_event_start('call map_fn')
+
             if self.do_map_per_chunk:
-                result = self.map_fn(chunk_num, data)
-                assert type(result) is dict
-                out_chunk = chunk_num
-            else:
-                # Run map_fn() once per (key, value) pair.
-                result = defaultdict(list)
-                for in_k, in_v in data.items():
-                    out = self.map_fn(in_k, in_v)
-                    if out is None:
-                        continue
-                    for out_k, out_v in out.items():
-                        assert type(out_v) is list
-                        self._dbg_log_event_start('append out to result')
-                        result[out_k].extend(out_v)
+                if not self._is_output_done(chunk_num):
+                    result = self.map_fn(chunk_num, data)
+                    assert type(result) is dict
+                    self._save_output(result, chunk_num)
+                map_pbar_q.put(1)
+                return
+
+            # Run map_fn() once per (key, value) pair.
+            result = defaultdict(list)
+            for in_k, in_v in data.items():
+                out = self.map_fn(in_k, in_v)
+                if out is None:
+                    continue
+                for out_k, out_v in out.items():
+                    assert type(out_v) is list
+                    self._dbg_log_event_start('append out to result')
+                    result[out_k].extend(out_v)
 
         self._dbg_log_event_start('mark input as saved')
         for key, value in result.items():
@@ -509,7 +511,10 @@ class Job(object):
         end_fn = lambda: 0
 
         t = len(self.input)
-        pbar_args = (map_pbar_q, t, 'Map to cache')
+        desc = 'Map to cache'
+        if self.do_map_per_chunk:
+            desc = 'Map chunks to output dir'
+        pbar_args = (map_pbar_q, t, desc)
 
         # XXX TODO
         progress = pass_thru if self.do_silent_mode else tqdm
