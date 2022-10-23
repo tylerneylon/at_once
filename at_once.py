@@ -106,6 +106,15 @@ do_dbg_timing = True
 
 
 # ______________________________________________________________________
+# Constants
+
+# Constants for map types.
+ARBITRARY  = 'arbitrary'
+KEEP_KEYS  = 'keep keys'
+MAP_CHUNKS = 'map chunks'
+
+
+# ______________________________________________________________________
 # Queues
 
 map_pbar_q   = mp.Queue()
@@ -135,7 +144,7 @@ class Job(object):
             do_map_per_chunk = False,
             job_key          = None,
             do_silent_mode   = False,
-            map_type         = 'arbitrary',
+            map_type         = ARBITRARY,
             **kwargs
     ):
         self.do_silent_mode = do_silent_mode
@@ -200,18 +209,15 @@ class Job(object):
 
         self.do_map_per_chunk = do_map_per_chunk
 
+        assert map_type in [ARBITRARY, KEEP_KEYS, MAP_CHUNKS]
+        self.map_type = map_type
+
         # Set up debug log.
         self.last_event = None
         self.last_time  = None
         self.dbg_log = self.cache_dir / 'dbg_log.jsonl'
 
         self.dbg_timing = {}
-
-    def _assign_name(self, i):
-        proc = mp.current_process()
-        proc.name = str(i)
-        # XXX
-        # print(f'My name is {proc.name}')
 
     def _say(self, s):
         if self.do_silent_mode:
@@ -261,7 +267,53 @@ class Job(object):
         t = time.asctime()
         # print(f'{proc.name} {t}: {s}', flush=True)
 
-    def _handle_input(self, inp):
+    # TODO: Factor out the commonalities between this and handle_cache().
+    def _handle_chunked_input(self, chunked_inp):
+
+        # XXX
+        # print(f'_handle_chunked_input() called on {chunked_inp}')
+
+        assert self.output_dir is not None
+
+        i, inp_list = chunked_inp
+        n = self.num_output_files
+        num_digits = len(str(n - 1))
+        filename = f'{str(i).zfill(num_digits)}_of_{n}.pickle'
+        output_path = self.output_dir / filename
+        # XXX
+        # print(f'output_path = {output_path}')
+        if self.is_output_path_done(output_path):
+            map_pbar_q.put(1)
+            return
+
+        chunk_result = defaultdict(list)
+        # XXX
+        # print(f'inp_list = {inp_list}')
+        for inp in inp_list:
+            result = self._handle_input(inp, do_save_to_cache=False)
+            # TODO: Check if chunk is already done in the output dir.
+            assert result is not None
+            if self.is_one_value:
+                chunk_result.update(result)
+            else:
+                for key, value in result.items():
+                    chunk_result[key].extend(value)
+            map_pbar_q.put(1)
+        chunk_result = dict(chunk_result)
+
+        # TODO: Call combine_fn(), like in handle_cache(), here.
+
+        with output_path.open('wb') as f:
+            pickle.dump(chunk_result, f)
+        self.save_output_receipt(output_path)
+
+    def _handle_input(self, inp, do_save_to_cache=True):
+        """ This expects a single input `inp`, and calls out to the user's map
+            function.
+        """
+
+        # XXX
+        # print(f'_handle_input() called on {inp}')
 
         # self._print(f'About to handle input: {inp}')
         self._dbg_log_event_start('start of input')
@@ -282,6 +334,8 @@ class Job(object):
             self._dbg_log_event_start('verify map_fn() output type')
             if not self.is_one_value:
                 assert all(type(v) is list for v in result.values())
+            if not do_save_to_cache:
+                return result
         else:
             # Process input files.
             chunk_num = int(Path(inp).stem.split('_')[0])
@@ -337,7 +391,8 @@ class Job(object):
 
         # If a data receipt exists, skip out early.
         # We send a message to the appropriate queue for progress.
-        if self.does_cache_have_output(cache_file):
+        output_path = self.get_output_path(cache_file)
+        if self.is_output_path_done(output_path):
             cache_pbar_q.put(1)
             return
 
@@ -445,10 +500,9 @@ class Job(object):
             receipt = {'saved_file': filepath.name, 'ctime': ctime}
             f.write(json.dumps(receipt) + '\n')
 
-    def does_cache_have_output(self, cache_file):
+    def is_output_path_done(self, output_path):
 
         # Check that the output file exists.
-        output_path     = self.get_output_path(cache_file)
         if not output_path.is_file():
             return False
 
@@ -477,28 +531,36 @@ class Job(object):
         self.reduce_fn  = reduce_fn
 
         t = len(self.input)
+        pbar_args = (map_pbar_q, t, 'Map to cache')
 
         # XXX TODO
         progress = pass_thru if self.do_silent_mode else tqdm
 
+        self.is_input_pre_chunked = False
+        input_handler = self._handle_input
+
+        if self.map_type == KEEP_KEYS and self.input_type == 'list':
+            self.is_input_pre_chunked = True
+            # Pull together same-chunk inputs.
+            n = self.num_output_files
+            chunked_inputs = defaultdict(list)
+            for x in self.input:
+                chunked_inputs[hash(str(x)) % n].append(x)
+            self.input = list(chunked_inputs.items())
+            pbar_args = (map_pbar_q, t, 'Map to output dir')
+            input_handler = self._handle_chunked_input
+
         if self.num_processes == 1:
             for inp in progress(self.input):
-                self._handle_input(inp)
+                input_handler(inp)
         else:
 
             # Set up the progress bar.
             def show_pbar(q, t, desc):
-                # print(f'Starting show_pbar(), i={i}')
-                n = 0
                 pbar = tqdm(total=t, desc=desc)
                 for j in iter(q.get, 'STOP'):
                     pbar.update(1)
-                    n += 1
-                    # XXX
-                    if False:
-                        if (n % 10) == 0:
-                            print(f'In show_pbar(), n={n}')
-                pbar.update(n=pbar.total - n)
+                pbar.update(n=pbar.total - pbar.n)
                 pbar.close()
 
             def avg_times(q):
@@ -509,18 +571,14 @@ class Job(object):
                 for k, v in times.items():
                     print(f'{k}: {sum(v) / len(v):.4f}')
 
-            pbar_args = (map_pbar_q, t, 'Map to cache')
             mp.Process(target=show_pbar, args=pbar_args).start()
 
             if do_dbg_timing:
                 mp.Process(target=avg_times, args=(avg_times_q,)).start()
 
             N = self.num_processes
-            # print(f'Starting map_fn() calls, t={t}')  # XXX
             with mp.Pool(N) as p:
-                list(p.map(self._assign_name, range(N)))
-                # inp = zip(self.input, repeat(q))
-                list(p.map(self._handle_input, self.input))
+                list(p.map(input_handler, self.input))
                 map_pbar_q.put('STOP')
 
         if self.output_dir:
