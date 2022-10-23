@@ -257,38 +257,25 @@ class Job(object):
                 'key'   : key,
                 'value' : encode(value),
                 'run_id': self.run_id,
-                'input' : inp
+                'input' : str(inp)
             })
             f.write(s + '\n')
 
-    # XXX
-    def _print(self, s):
-        proc = mp.current_process()
-        t = time.asctime()
-        # print(f'{proc.name} {t}: {s}', flush=True)
-
     # TODO: Factor out the commonalities between this and handle_cache().
     def _handle_chunked_input(self, chunked_inp):
-
-        # XXX
-        # print(f'_handle_chunked_input() called on {chunked_inp}')
+        """ This expects chunked_inp = (chunk_num, input_list).
+            This maps all inputs at once, saving them directly to the output
+            directory.
+        """
 
         assert self.output_dir is not None
 
-        i, inp_list = chunked_inp
-        n = self.num_output_files
-        num_digits = len(str(n - 1))
-        filename = f'{str(i).zfill(num_digits)}_of_{n}.pickle'
-        output_path = self.output_dir / filename
-        # XXX
-        # print(f'output_path = {output_path}')
-        if self.is_output_path_done(output_path):
+        chunk_num, inp_list = chunked_inp
+        if self._is_output_done(chunk_num):
             map_pbar_q.put(1)
             return
 
         chunk_result = defaultdict(list)
-        # XXX
-        # print(f'inp_list = {inp_list}')
         for inp in inp_list:
             result = self._handle_input(inp, do_save_to_cache=False)
             # TODO: Check if chunk is already done in the output dir.
@@ -301,36 +288,26 @@ class Job(object):
             map_pbar_q.put(1)
         chunk_result = dict(chunk_result)
 
-        # TODO: Call combine_fn(), like in handle_cache(), here.
-
-        with output_path.open('wb') as f:
-            pickle.dump(chunk_result, f)
-        self.save_output_receipt(output_path)
+        # Save to disk with a data receipt.
+        self._save_output(chunk_result, chunk_num)
 
     def _handle_input(self, inp, do_save_to_cache=True):
         """ This expects a single input `inp`, and calls out to the user's map
             function.
         """
 
-        # XXX
-        # print(f'_handle_input() called on {inp}')
-
-        # self._print(f'About to handle input: {inp}')
         self._dbg_log_event_start('start of input')
 
         # Check to see if `inp` already has output in our cache_dir.
         if inp in self.run_id_of_input:
-            # self._print(f'    Skipping bc its cached.')
             map_pbar_q.put(1)
             return
 
         # Process the input.
         out_chunk = None
         if self.input_type == 'list':
-            # self._print(f'About to call map_fn on {inp}')
             self._dbg_log_event_start('call map_fn()')
             result = self.map_fn(inp)
-            # self._print(f'Just finished map_fn on {inp}')
             self._dbg_log_event_start('verify map_fn() output type')
             if not self.is_one_value:
                 assert all(type(v) is list for v in result.values())
@@ -338,10 +315,14 @@ class Job(object):
                 return result
         else:
             # Process input files.
-            chunk_num = int(Path(inp).stem.split('_')[0])
+            inp = Path(inp)
+            if not inp.is_file():
+                # TODO: Log that we're skipping this.
+                return
+            chunk_num = int(inp.stem.split('_')[0])
             self._dbg_log_event_start('load from pickle file')
 
-            with open(inp, 'rb') as f:
+            with inp.open('rb') as f:
                 data = pickle.load(f)
 
             self._dbg_log_event_start('call map_fn')
@@ -369,7 +350,10 @@ class Job(object):
         #       writes. In the meantime, it looks like writes under ~1k
         #       will be atomic on my os/fs, so this is ok for now.
         with self.data_receipt.open('a') as f:
-            f.write(json.dumps({'input': inp, 'run_id': self.run_id}) + '\n')
+            f.write(json.dumps({
+                'input': str(inp),
+                'run_id': self.run_id
+            }) + '\n')
         self.run_id_of_input[inp] = self.run_id
         self._dbg_log_event_start('ready for next input')
 
@@ -385,14 +369,63 @@ class Job(object):
             duration = time.time() - self.dbg_timing[time_type]
             avg_times_q.put((time_type, duration))
 
+    def _get_output_path(self, chunk_num):
+        """ This returns the output path, as a Path instance, for the given
+            chunk_num. """
+        n           = self.num_output_files
+        num_digits  = len(str(n - 1))
+        filename    = f'{str(chunk_num).zfill(num_digits)}_of_{n}.pickle'
+        return self.output_dir / filename
+
+    def _is_output_done(self, chunk_num):
+        """ This returns True iff the given chunk number is already saved to
+            disk and in the data receipt in the output directory.
+        """
+        output_path = self._get_output_path(chunk_num)
+
+        # Check that the output file exists.
+        if not output_path.is_file():
+            return False
+
+        # Check that the output file has a receipt.
+        output_receipts = self.get_output_receipts()
+        receipt_ctime = output_receipts.get(output_path.name, None)
+        if receipt_ctime is None:
+            return False
+
+        # Verify that the output receipt is for this data. This is a heuristic
+        # that, in practice, I expect to essentially always work.
+        file_ctime = output_path.stat().st_ctime
+        return abs(file_ctime - receipt_ctime) < 0.001
+
+    def _save_output(self, output, chunk_num):
+        """ This expects `output` to be mapping from keys to values. This
+            applies any appropriate combine_fn to the values, saves the result
+            to disk, and records this in the output data receipt. """
+
+        # Determine the output file path.
+
+        # Apply combine_fn as appropriate.
+        if self.combine_fn and not self.is_one_value:
+            for key, values in output.items():
+                v = values.pop()
+                while len(values) > 0:
+                    v = self.combine_fn(key, v, values.pop())
+                output[key] = v
+
+        output_path = self._get_output_path(chunk_num)
+        with output_path.open('wb') as f:
+            pickle.dump(output, f)
+        self.save_output_receipt(output_path)
+
     def _handle_cache(self, cache_file):
 
         assert self.output_dir is not None
 
         # If a data receipt exists, skip out early.
         # We send a message to the appropriate queue for progress.
-        output_path = self.get_output_path(cache_file)
-        if self.is_output_path_done(output_path):
+        chunk_num = int(Path(cache_file).name.split('_')[0])
+        if self._is_output_done(chunk_num):
             cache_pbar_q.put(1)
             return
 
@@ -402,39 +435,15 @@ class Job(object):
         with open(cache_file) as f:
             for i, line in enumerate(f):
                 self._start_dbg_time('json_decode')
-                try:
-                    obj = json.loads(line)
-                except json.decoder.JSONDecodeError as e:
-                    # XXX
-                    print(e)
-                    print('Exception in _handle_cache()')
-                    print(f'cache_file = {cache_file}')
-                    print(f'reading in 0-based line {i}')
-                    print(f'line has length {len(line)}')
-                    print()
-                    print('Beginning of line is below:')
-                    print(line[:1000])
-                    print()
-                    print('Ending of line is next:')
-                    print(line[-1000:])
-                    raise
+                obj = json.loads(line)
                 self._end_dbg_time('json_decode')
 
                 self._start_dbg_time('post_json_decode_checks')
-                # XXX
-                if 'input' not in obj:
-                    print('\n\n\n')
-                    print(f'Problem in {cache_file}')
-                    print(f'On 1-based line number {i + 1}')
 
                 inp_run_id = self.run_id_of_input.get(obj['input'], None)
                 if obj['run_id'] not in [inp_run_id, self.run_id]:
-                    print('\n\n\n')
-                    print(f'In cache file {cache_file}:')
-                    print(f'   Skipping item for input {obj["input"]}')
-                    print(f'   Its run_id={obj["run_id"]} but ', end='')
-                    print(f'run_id on file is {inp_run_id}')
-                    print(f'   My run id is {self.run_id}')
+                    # TODO: Log that we are skipping an output that
+                    #       appears to be corrupt or outdated.
                     continue
                 self._end_dbg_time('post_json_decode_checks')
 
@@ -448,31 +457,12 @@ class Job(object):
                     cache[obj['key']].extend(value)
         cache = dict(cache)
 
-        self._print(f'Before pickling, cache has size {len(cache)}')
-
-        if self.combine_fn:
-            for key, values in cache.items():
-                v = values.pop()
-                while len(values) > 0:
-                    v = self.combine_fn(key, v, values.pop())
-                cache[key] = v
-
-        # TODO: Call reduce_fn() if it's present.
-
         # Save to the official output directory.
         self._start_dbg_time('write_to_file')
-        output_path = self.get_output_path(cache_file)
-        with output_path.open('wb') as f:
-            pickle.dump(cache, f)
-        self.save_output_receipt(output_path)
+        self._save_output(cache, chunk_num)
         self._end_dbg_time('write_to_file')
 
-        # print(f'Sending out 2 to pbar_q.')  # XXX
         cache_pbar_q.put(1)
-
-    def get_output_path(self, cache_file):
-        name = cache_file.name
-        return self.output_dir / (name.split('.')[0] + '.pickle')
 
     def get_output_receipts(self):
         if 'output_receipts' not in self.__dict__:
@@ -500,24 +490,6 @@ class Job(object):
             receipt = {'saved_file': filepath.name, 'ctime': ctime}
             f.write(json.dumps(receipt) + '\n')
 
-    def is_output_path_done(self, output_path):
-
-        # Check that the output file exists.
-        if not output_path.is_file():
-            return False
-
-        # Check that the output file has a receipt.
-        output_receipts = self.get_output_receipts()
-        receipt_ctime = output_receipts.get(output_path.name, None)
-        if receipt_ctime is None:
-            return False
-
-        # Verify that the output receipt is for this data.
-        # This is a heuristic that, in practice, I expect to essentially always
-        # work.
-        file_ctime = output_path.stat().st_ctime
-        return abs(file_ctime - receipt_ctime) < 0.001
-
     def run(
             self,
             map_fn     = None,
@@ -529,6 +501,12 @@ class Job(object):
         self.map_fn     = map_fn
         self.combine_fn = combine_fn
         self.reduce_fn  = reduce_fn
+
+        if len(self.input) == 0:
+            print('Nothing to do since input length = 0.')
+            return
+
+        end_fn = lambda: 0
 
         t = len(self.input)
         pbar_args = (map_pbar_q, t, 'Map to cache')
@@ -574,6 +552,7 @@ class Job(object):
             mp.Process(target=show_pbar, args=pbar_args).start()
 
             if do_dbg_timing:
+                end_fn = lambda: avg_times_q.put('STOP')
                 mp.Process(target=avg_times, args=(avg_times_q,)).start()
 
             N = self.num_processes
@@ -583,17 +562,19 @@ class Job(object):
 
         if self.output_dir:
             cache_data = list(self.cache_dir.glob(f'*_of_*.jsonl'))
-            t = len(cache_data)
+            if len(cache_data) == 0:
+                end_fn()
+                return
             if self.num_processes == 1:
                 for cache_item in progress(cache_data):
                     self._handle_cache(cache_item)
             else:
-                pbar_args = (cache_pbar_q, t, 'Cache to output')
+                pbar_args = (cache_pbar_q, len(cache_data), 'Cache to output')
                 mp.Process(target=show_pbar, args=pbar_args).start()
                 with mp.Pool(N) as p:
                     list(p.map(self._handle_cache, cache_data))
                     cache_pbar_q.put('STOP')
-                    avg_times_q.put('STOP')
+        end_fn()
 
 
 # ______________________________________________________________________
