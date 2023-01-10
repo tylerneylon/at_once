@@ -63,7 +63,6 @@ class Job(object):
         # Work with our primary arguments.
 
         assert inputs  is not None
-        assert outputs is not None
         assert map_fn  is not None
 
         self.inputs     = inputs
@@ -91,8 +90,11 @@ class Job(object):
         def be_done():
             self._log_ending(start_time)
 
-        input_list = self._get_input_list()
-        n_inputs   = len(input_list)
+        input_list  = self._get_input_list()
+        n_inputs    = len(input_list)
+        # If self.inputs was a lambda, then we need to drop it so that self
+        # becomes pickleable.
+        self.inputs = None
         if n_inputs == 0:
             print('Warning: input list is empty; nothing to do.')
             return be_done()
@@ -117,10 +119,14 @@ class Job(object):
             with mp.Pool(N) as p:
                 list(p.map(self._handle_input, input_list))
                 map_pbar_q.put('STOP')
+                p.close()
+                p.join()
 
         be_done()  # This logs the ending.
 
     def log(self, msg_obj):
+        if self.outputs is None:
+            return
         with self.logfile.open('a') as f:
             fcntl.flock(f.fileno(), fcntl.LOCK_EX)
             f.write(json.dumps(msg_obj) + '\n')
@@ -180,6 +186,7 @@ class Job(object):
         # Case 2: Our input is a function that will return a list of values;
         #         each value will be sent to map_fn().
         if callable(self.inputs):
+            self.reader = pass_thru
             return self.inputs()
 
         # Case 3: Our input is a list of a file paths.
@@ -198,6 +205,10 @@ class Job(object):
         map_pbar_q.put(1)
 
     def _input_is_done(self, inp):
+
+        if self.outputs is None:
+            return False
+
         receipts = self._get_output_receipts()
         outpath  = self.out_dir / Path(inp).name
         if outpath.name not in receipts:
@@ -225,7 +236,11 @@ class Job(object):
     # TODO: Warn if it looks like we've already saved here.
     def _save_output(self, inp, out):
 
-        # Case 1: self.outputs is a string, interpreted as a pickle directory.
+        # Case 1: No saved output. Then we do nothing.
+        if self.outputs is None:
+            return
+
+        # Case 2: self.outputs is a string, interpreted as a pickle directory.
         outpath = self.out_dir / Path(inp).name
         if outpath.is_file():
             print(f'Warning: Got multiple outputs for input {inp}')
@@ -266,6 +281,10 @@ class Job(object):
             f.write(json.dumps(receipt) + '\n')
 
     def _get_output_receipts(self):
+        ''' Output receipts come in the form of a dict.
+            Each key is a saved output file name.
+            Each value is a ctime for that file.
+        '''
         if 'output_receipts' in self.__dict__:
             return self.output_receipts
 
